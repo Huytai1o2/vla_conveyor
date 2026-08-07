@@ -1,0 +1,16 @@
+# Python virtual environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Runtime/debug captures
+debug_step_*.jpg
+
+# Local editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+
+# PlatformIO build artifacts
+conveyor_firmware/.pio/
