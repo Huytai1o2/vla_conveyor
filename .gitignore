@@ -4,6 +4,9 @@ venv/
 __pycache__/
 *.py[cod]
 
+# Local secrets
+.env
+
 # Runtime/debug captures
 debug_step_*.jpg
 
