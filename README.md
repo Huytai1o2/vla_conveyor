@@ -12,11 +12,25 @@ source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 ```
 
-Set the credentials required by the Google GenAI SDK, configure the camera and serial-port constants in `controller.py`, then run:
+Create a local `.env` file from the example and add a Gemini API key created in [Google AI Studio](https://aistudio.google.com/app/apikey):
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set the value (keep the key private):
+
+```dotenv
+GEMINI_API_KEY=your_gemini_api_key
+```
+
+The controller automatically loads this file. Configure the camera and serial-port constants in `controller.py`, then run:
 
 ```bash
 python controller.py
 ```
+
+Never commit `.env`; it is excluded by `.gitignore`. Use `.env.example` as the shareable template.
 
 ## Firmware
 

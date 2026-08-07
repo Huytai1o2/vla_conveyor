@@ -1,5 +1,6 @@
 import threading
 import time
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -9,6 +10,10 @@ import serial
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+
+load_dotenv(Path(__file__).with_name(".env"))
 
 
 # ---------- CONFIG ----------
@@ -52,7 +57,13 @@ class VLAResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
 
 
-client = genai.Client()
+api_key = os.getenv("GEMINI_API_KEY")
+if not api_key:
+    raise RuntimeError(
+        "Thiếu GEMINI_API_KEY. Hãy điền API key vào file .env."
+    )
+
+client = genai.Client(api_key=api_key)
 
 PROMPT = """
 You are the high-level Vision-Language-Action controller of a reversible conveyor.

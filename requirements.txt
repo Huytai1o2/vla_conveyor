@@ -3,3 +3,4 @@ numpy
 pyserial
 google-genai
 pydantic
+python-dotenv
