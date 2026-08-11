@@ -1,121 +1,121 @@
 # VLA Conveyor Control
 
-Hệ thống Vision-Language-Action (VLA) dùng Gemini để nhận diện vật thể theo yêu cầu của người vận hành, sinh action điều khiển và đưa vật thể vào vùng giữa của băng chuyền đảo chiều.
+A Vision-Language-Action (VLA) system that uses Gemini to identify an operator-specified object, generate conveyor actions, and center the object on a reversible conveyor belt.
 
-> Trạng thái hiện tại: phần mềm đã qua kiểm tra cú pháp, mock state machine, action validation và giao thức serial. Hệ thống vẫn cần hoàn thành checklist bench-test với camera, YoloUNO và motor thật trước khi được xem là sẵn sàng chạy production hoặc chạy không giám sát.
+> Current status: the software has passed syntax checks and mock tests for the state machine, action validation, and serial protocol. The hardware bench-test checklist must still be completed with the real camera, YoloUNO board, and motor before the system is considered production-ready or safe for unattended operation.
 
-## Kiến trúc và flow hoạt động
+## Architecture and Runtime Flow
 
 ```text
-Kết nối YoloUNO + camera
-          |
-          v
-Calibration: chọn 4 góc băng chuyền
-          |
-          v
-OpenCV tạo perspective transform 1000 x 300
-          |
-          v
-Mở dashboard
-  - ảnh calibrated realtime bên trái
-  - chat, trạng thái và log bên phải
-          |
-          v
-Người dùng nhập yêu cầu vật thể
-          |
-          v
-Ảnh calibrated + instruction + thông số băng chuyền
-          |
-          v
-Gemini sinh VLA action
+Connect the YoloUNO and camera
+              |
+              v
+Calibration: select the four conveyor corners
+              |
+              v
+OpenCV creates a 1000 x 300 perspective transform
+              |
+              v
+Open the dashboard
+  - calibrated real-time image on the left
+  - chat, status, and logs on the right
+              |
+              v
+The operator submits an object instruction
+              |
+              v
+Calibrated image + instruction + conveyor parameters
+              |
+              v
+Gemini generates a VLA action
   direction + duration_ms + task_status
-          |
-          v
-Controller validate action và hiển thị action token
-          |
-          v
-Chuyển action sang lệnh serial của firmware
-          |
-          v
-YoloUNO ACK -> chạy motor -> DONE
-          |
-          v
-Chờ vật ổn định, chụp frame mới và lặp lại
+              |
+              v
+The controller validates and displays the action tokens
+              |
+              v
+The action is adapted to the firmware serial protocol
+              |
+              v
+YoloUNO ACK -> motor movement -> DONE
+              |
+              v
+Wait for settling, capture a fresh frame, and repeat
 ```
 
-### Phân chia trách nhiệm
+### Responsibility Boundaries
 
-OpenCV chỉ được dùng để:
+OpenCV is used only to:
 
-- Đọc camera.
-- Cho người dùng chọn bốn góc băng chuyền.
-- Tính và áp dụng perspective transform.
-- Tạo ảnh calibrated `1000 x 300` và vẽ vùng giữa.
-- Hiển thị/encode ảnh.
+- Capture camera frames.
+- Let the operator select the four conveyor corners.
+- Calculate and apply the perspective transform.
+- Produce the calibrated `1000 x 300` image and draw the center target zone.
+- Display and encode images.
 
-Gemini chịu trách nhiệm:
+Gemini is responsible for:
 
-- Tìm đúng vật thể khớp với instruction trong sidebar.
-- Trả tâm vật thể chuẩn hóa `[y, x]`.
-- Quyết định `LEFT`, `RIGHT` hoặc `STOP`.
-- Sinh trực tiếp `duration_ms` và `task_status`.
+- Finding the object that matches the instruction submitted in the sidebar.
+- Returning the normalized object center as `[y, x]`.
+- Selecting `LEFT`, `RIGHT`, or `STOP`.
+- Generating `duration_ms` and `task_status` directly.
 
-Python controller không dùng tọa độ để tính lại action. Controller chỉ kiểm tra kết quả Gemini có an toàn và hợp lệ trước khi gửi xuống firmware.
+The Python controller does not recalculate an action from the returned coordinates. It only verifies that Gemini's result is safe and valid before communicating with the firmware.
 
-## VLA action và firmware protocol
+## VLA Actions and Firmware Protocol
 
-Kết quả Gemini hợp lệ được biểu diễn trong GUI bằng action token:
+A valid Gemini result is shown in the dashboard as an action-token sequence:
 
 ```text
 [ACT_RIGHT] [DURATION_0780_MS] [STATUS_MOVE]
 ```
 
-Action token chỉ dùng để hiển thị và audit. Firmware hiện tại không parse chuỗi có dấu ngoặc. Controller chuyển action sang protocol mà `conveyor_firmware/src/main.cpp` hỗ trợ:
+The bracketed action tokens are used only for display and auditing. The current firmware does not parse the bracketed representation. The controller adapts it to the protocol implemented in `conveyor_firmware/src/main.cpp`:
 
-| Controller gửi | Firmware trả | Ý nghĩa |
+| Controller sends | Firmware responds | Meaning |
 |---|---|---|
-| `PING\n` | `PONG` | Kiểm tra kết nối |
-| `STOP\n` | `STOPPED` | Dừng motor |
-| `MOVE,RIGHT,780\n` | `ACK,RIGHT,780`, sau đó `DONE` | Chạy sang phải trong 780 ms |
-| `MOVE,LEFT,300\n` | `ACK,LEFT,300`, sau đó `DONE` | Chạy sang trái trong 300 ms |
+| `PING\n` | `PONG` | Verify the board connection |
+| `STOP\n` | `STOPPED` | Stop the motor |
+| `MOVE,RIGHT,780\n` | `ACK,RIGHT,780`, then `DONE` | Move right for 780 ms |
+| `MOVE,LEFT,300\n` | `ACK,LEFT,300`, then `DONE` | Move left for 300 ms |
 
-Controller chỉ cho phép duration từ `80` đến `1500 ms`, dù firmware có thể nhận từ `50` đến `3000 ms`.
+The host controller allows durations from `80` to `1500 ms`, even though the firmware accepts values from `50` to `3000 ms`.
 
-`IMAGE_RIGHT_IS_FORWARD` trong `conveyor_firmware/src/main.cpp` ánh xạ hướng trên ảnh sang chiều quay vật lý của motor:
+`IMAGE_RIGHT_IS_FORWARD` in `conveyor_firmware/src/main.cpp` maps image-relative movement to the physical motor direction:
 
-- Với `false`: `MOVE,RIGHT` dùng `MOTOR_BACKWARD`, `MOVE,LEFT` dùng `MOTOR_FORWARD`.
-- Nếu lệnh `MOVE,RIGHT` làm vật đi sang trái trên ảnh calibrated, đổi giá trị này thành `true` và nạp lại firmware.
+- When set to `false`, `MOVE,RIGHT` uses `MOTOR_BACKWARD`, while `MOVE,LEFT` uses `MOTOR_FORWARD`.
+- If `MOVE,RIGHT` makes the object move left in the calibrated image, change this value to `true` and flash the firmware again.
 
-## Vòng đời một instruction
+## Instruction Lifecycle
 
-1. Sau calibration, dashboard chuyển sang `WAITING_FOR_PROMPT`.
-2. Người dùng nhập instruction trong sidebar bên phải và bấm **Send**.
-3. Composer bị khóa trong khi instruction đang chạy.
-4. Gemini phân tích frame mới nhất và sinh action.
-5. Controller validate action, in action token rồi mới gửi serial command.
-6. Với `MOVE`, controller đợi đúng `ACK,<direction>,<duration>` rồi mới chấp nhận `DONE`.
-7. Sau mỗi pulse, controller chờ vật ổn định rồi phân tích frame mới.
-8. Với `CENTERED`, motor nhận `STOP`, sidebar in `SUCCESS` và composer được mở cho instruction tiếp theo.
+1. After calibration, the dashboard enters `WAITING_FOR_PROMPT`.
+2. The operator enters an instruction in the right sidebar and selects **Send**.
+3. The composer is disabled while that instruction is active.
+4. Gemini analyzes the latest frame and generates an action.
+5. The controller validates the action and displays its action tokens before sending a serial command.
+6. For `MOVE`, the controller requires the exact `ACK,<direction>,<duration>` before accepting `DONE`.
+7. After every pulse, the controller waits for the object to settle and analyzes a fresh frame.
+8. For `CENTERED`, the motor receives `STOP`, the sidebar displays `SUCCESS`, and the composer is enabled for the next instruction.
 
-Nếu vật thể bị lấy khỏi băng chuyền hoặc không còn khớp instruction:
+If the object is removed or no longer matches the instruction:
 
-- Pulse đang chạy được phép hoàn thành.
-- Lần inference tiếp theo gửi/giữ `STOP`.
-- Sidebar in `WARNING: target not recognized - retry n/20`.
-- Nếu vật quay lại, counter được reset và vòng điều khiển tiếp tục.
-- Sau 20 kết quả no-match liên tiếp, instruction bị hủy và composer được mở lại.
+- A motor pulse that has already started is allowed to finish.
+- The next inference sends or maintains `STOP`.
+- The sidebar displays `WARNING: target not recognized - retry n/20`.
+- If the matching object returns, the counter resets and control resumes.
+- After 20 consecutive no-match results, the instruction is abandoned and the composer is enabled again.
 
-Lỗi Gemini connection, timeout, rate limit, JSON/schema hoặc action không hợp lệ dùng counter riêng `n/5`:
+Gemini connection failures, timeouts, rate limits, invalid JSON/schema, and invalid actions use a separate `n/5` technical retry counter:
 
-- Motor luôn được giữ ở `STOP`.
-- Lỗi network hiển thị `RECONNECTING`.
-- Dữ liệu/schema không hợp lệ hiển thị `ERROR`.
-- Một kết quả Gemini hợp lệ sẽ reset technical counter.
-- Technical failure thứ năm kích hoạt safe shutdown.
+- The motor remains at `STOP`.
+- Network failures are displayed as `RECONNECTING`.
+- Invalid model data or schema is displayed as `ERROR`.
+- Any valid Gemini result resets the technical counter.
+- The fifth consecutive technical failure triggers a safe shutdown.
 
-## Cài đặt và chạy
+## Installation and Startup
 
-Tạo virtual environment và cài dependencies:
+Create a virtual environment and install the dependencies:
 
 ```bash
 python -m venv .venv
@@ -123,7 +123,7 @@ source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Tạo `.env` từ file mẫu và thêm Gemini API key:
+Create `.env` from the example file and add a Gemini API key:
 
 ```bash
 cp .env.example .env
@@ -133,7 +133,7 @@ cp .env.example .env
 GEMINI_API_KEY=your_gemini_api_key
 ```
 
-Kiểm tra các constant trong `controller.py` trước khi chạy:
+Verify the following constants in `controller.py` before starting:
 
 ```python
 CAMERA_INDEX = 0
@@ -144,7 +144,7 @@ SPEED_TEST_DISTANCE_CM = 77.0
 SPEED_TEST_TIME_S = 5.5925
 ```
 
-Đóng PlatformIO Serial Monitor để tránh chiếm COM port, sau đó chạy:
+Close the PlatformIO Serial Monitor so it does not hold the COM port, then run:
 
 ```bash
 python controller.py
@@ -152,124 +152,124 @@ python controller.py
 
 ### Calibration
 
-1. Nhấn `S` để chốt frame calibration hoặc `Q` để thoát.
-2. Click bốn góc của vùng băng chuyền theo thứ tự bất kỳ.
-3. Chuột phải để undo, `R` để chọn lại.
-4. Nhấn `Enter`, `Space` hoặc Return khi polygon hợp lệ.
-5. Không di chuyển camera sau calibration. Nếu camera bị đổi vị trí, phải calibrate lại.
+1. Press `S` to capture the calibration frame or `Q` to exit.
+2. Click the four corners of the conveyor region in any order.
+3. Right-click to undo, or press `R` to start the selection again.
+4. Press `Enter`, `Return`, or `Space` when the polygon is valid.
+5. Do not move the camera after calibration. Recalibrate whenever the camera position changes.
 
-Sau calibration, dashboard xuất hiện với ảnh calibrated realtime bên trái và sidebar điều khiển bên phải.
+After calibration, the dashboard opens with the calibrated real-time image on the left and the control sidebar on the right.
 
-## Bench-test với phần cứng thật
+## Hardware Bench-Test Checklist
 
-Bench-test là kiểm tra tích hợp trên bàn với camera, board và motor thật. Thực hiện theo thứ tự dưới đây; không bỏ qua các bước an toàn đầu tiên.
+A bench test verifies the complete integration with the physical camera, controller board, and motor. Run the checks in the following order and do not skip the initial safety steps.
 
-### 0. Chuẩn bị an toàn
+### 0. Safety Preparation
 
-- Dọn sạch vùng nguy hiểm quanh băng chuyền.
-- Dùng một vật nhẹ, không dễ kẹt để thử nghiệm.
-- Bảo đảm có thể ngắt nguồn motor ngay lập tức.
-- Không để tay gần cơ cấu truyền động khi gửi lệnh MOVE.
-- Đóng PlatformIO Serial Monitor trước khi mở controller.
+- Clear the hazardous area around the conveyor.
+- Use a lightweight test object that is unlikely to jam the mechanism.
+- Ensure that motor power can be disconnected immediately.
+- Keep hands away from the drivetrain whenever a MOVE command may be sent.
+- Close the PlatformIO Serial Monitor before opening the controller.
 
-### 1. Firmware handshake
+### 1. Firmware Handshake
 
-- Nạp firmware trong thư mục `conveyor_firmware` vào YoloUNO.
-- Xác nhận baud rate `115200` và COM port đúng.
-- Chạy `serial_test.py` khi băng chuyền an toàn.
-- Pass khi board trả `PONG`, `ACK,RIGHT,300` và `DONE` đúng thứ tự.
-- Fail nếu thiếu ACK/DONE, ACK sai direction/duration hoặc xuất hiện `ERR,*`.
+- Flash the firmware from `conveyor_firmware` to the YoloUNO.
+- Verify the `115200` baud rate and the selected COM port.
+- Run `serial_test.py` only when conveyor movement is safe.
+- Pass when the board returns `PONG`, `ACK,RIGHT,300`, and `DONE` in that order.
+- Fail if ACK/DONE is missing, ACK contains the wrong direction or duration, or any `ERR,*` line appears.
 
-> `serial_test.py` có gửi một pulse `MOVE,RIGHT,300`; chỉ chạy khi motor có thể chuyển động an toàn.
+> `serial_test.py` sends one `MOVE,RIGHT,300` pulse. Run it only when the motor can move safely.
 
-### 2. Kiểm tra hướng motor
+### 2. Motor Direction
 
-- Đặt vật ở vùng dễ quan sát.
-- Gửi `MOVE,RIGHT,300`.
-- Pass nếu vật di chuyển sang phải trên ảnh calibrated.
-- Nếu vật đi sang trái, đổi `IMAGE_RIGHT_IS_FORWARD` trong firmware và nạp lại board.
-- Lặp lại với `MOVE,LEFT,300` và xác nhận vật đi sang trái.
+- Place an object where its movement is easy to observe.
+- Send `MOVE,RIGHT,300`.
+- Pass if the object moves right in the calibrated image.
+- If it moves left, change `IMAGE_RIGHT_IS_FORWARD` in the firmware and flash the board again.
+- Repeat with `MOVE,LEFT,300` and confirm that the object moves left.
 
-### 3. Kiểm tra STOP và DONE vật lý
+### 3. Physical STOP and DONE
 
-- Gửi một MOVE ngắn và quan sát motor.
-- Pass nếu motor dừng vật lý ngay khi firmware phát `DONE`.
-- Bấm **Stop / Exit** trong khi motor đang chạy.
-- Pass nếu controller gửi STOP, motor dừng và không có MOVE muộn xuất hiện sau thao tác Stop.
-- Ngắt nguồn ngay nếu motor vẫn quay sau `DONE` hoặc `STOPPED`.
+- Send a short MOVE command and observe the motor.
+- Pass if the motor physically stops when the firmware emits `DONE`.
+- Select **Stop / Exit** while the motor is moving.
+- Pass if the controller sends STOP, the motor stops, and no delayed MOVE appears after the Stop action.
+- Disconnect motor power immediately if the motor continues moving after `DONE` or `STOPPED`.
 
-### 4. Camera và calibration
+### 4. Camera and Calibration
 
-- Calibration ở ít nhất ba góc/độ cao camera hợp lý.
-- Xác nhận toàn bộ chiều dài băng chuyền nằm trong ảnh warped `1000 x 300`.
-- Xác nhận hai đường xanh luôn đánh dấu đúng vùng giữa.
-- Dịch chuyển camera sau calibration và xác nhận hệ thống yêu cầu/được chạy lại calibration trước khi tiếp tục.
+- Calibrate from at least three reasonable camera angles or mounting heights.
+- Confirm that the complete conveyor length maps into the `1000 x 300` warped image.
+- Confirm that the two green lines consistently mark the physical center zone.
+- Move the camera after calibration and verify that calibration is performed again before operation continues.
 
-### 5. Dashboard realtime
+### 5. Real-Time Dashboard
 
-- Xác nhận ảnh calibrated bên trái tiếp tục cập nhật khi idle, Gemini đang phân tích, motor đang chạy và controller đang retry.
-- Xác nhận sidebar nằm bên phải, có transcript auto-scroll, state hiện tại, composer, Send và Stop/Exit.
-- Xác nhận `INFO`, `SUCCESS`, `WARNING`, `RECONNECTING` và `ERROR` có thể phân biệt rõ.
-- Xác nhận GUI không bị treo trong thời gian Gemini gọi API hoặc chờ firmware.
+- Confirm that the calibrated image on the left continues updating while idle, during Gemini analysis, while the motor is moving, and during retries.
+- Confirm that the right sidebar includes an auto-scrolling transcript, current state, composer, Send, and Stop/Exit controls.
+- Confirm that `INFO`, `SUCCESS`, `WARNING`, `RECONNECTING`, and `ERROR` messages are visually distinguishable.
+- Confirm that the GUI remains responsive during Gemini API calls and firmware waits.
 
-### 6. Closed-loop centering
+### 6. Closed-Loop Centering
 
-- Đặt một vật lệch tâm và nhập instruction mô tả đúng vật đó.
-- Xác nhận action token xuất hiện trước firmware command.
-- Xác nhận action direction/duration trong token giống chính xác command `MOVE`.
-- Pass khi vật được đưa vào giữa, firmware nhận STOP, sidebar in SUCCESS và composer được mở lại.
+- Place an object away from the center and submit an instruction that describes it accurately.
+- Confirm that the action tokens appear before the firmware command.
+- Confirm that the direction and duration in the action tokens exactly match the `MOVE` command.
+- Pass when the object reaches the center, the firmware receives STOP, the sidebar displays SUCCESS, and the composer is enabled again.
 
-### 7. Vật bị lấy khỏi băng chuyền
+### 7. Object Removal
 
-- Trong lúc đang center, lấy vật ra sau khi một pulse đã bắt đầu.
-- Pass nếu pulse hiện tại hoàn thành, inference tiếp theo giữ motor STOP và warning tăng `1/20`, `2/20`, ...
-- Đặt đúng vật trở lại và xác nhận controller tự tiếp tục, đồng thời reset no-match counter.
-- Để vật vắng mặt đủ 20 lần và xác nhận instruction bị hủy nhưng ứng dụng vẫn chạy.
+- While centering is active, remove the object after a motor pulse has started.
+- Pass if the current pulse completes, the next inference keeps the motor stopped, and the warning increases through `1/20`, `2/20`, and so on.
+- Return the matching object and confirm that control resumes automatically and the no-match counter resets.
+- Leave the object absent for 20 attempts and confirm that the instruction is abandoned while the application remains active.
 
-### 8. Gemini retry
+### 8. Gemini Retries
 
-- Tạm thời tạo điều kiện mất mạng hoặc dùng mock để gây timeout/rate limit.
-- Xác nhận sidebar hiển thị `RECONNECTING n/5` và motor luôn STOP.
-- Dùng mock response sai schema để xác nhận sidebar hiển thị `ERROR`, không gửi MOVE.
-- Pass nếu technical failure thứ năm đóng ứng dụng an toàn.
+- Temporarily interrupt network access or use a mock to produce a timeout or rate-limit error.
+- Confirm that the sidebar displays `RECONNECTING n/5` and that the motor remains stopped.
+- Use an invalid-schema mock response and confirm that the sidebar displays `ERROR` without sending MOVE.
+- Pass if the fifth consecutive technical failure shuts the application down safely.
 
-### 9. Camera disconnect
+### 9. Camera Disconnection
 
-- Rút camera khi dashboard đang idle và khi đang chạy một instruction.
-- Pass nếu stale-frame detection chuyển sang ERROR, motor STOP và ứng dụng shutdown an toàn.
-- Fail nếu hệ thống tiếp tục dùng frame cũ để gửi MOVE.
+- Disconnect the camera while the dashboard is idle and while an instruction is active.
+- Pass if stale-frame detection enters ERROR, stops the motor, and shuts down safely.
+- Fail if the controller continues using an old frame to issue MOVE actions.
 
-### 10. Manual button
+### 10. Manual Buttons
 
-- Thử nút tiến/lùi vật lý khi host đang idle và khi một pulse đang chạy.
-- Xác nhận hành vi thực tế không làm motor tiếp tục chạy ngoài duration host đã yêu cầu.
-- Đây là test bắt buộc vì task nút bấm có thể thay đổi `motor_state` độc lập với host command.
+- Test the physical forward and reverse buttons while the host is idle and while a host pulse is active.
+- Confirm that manual input cannot leave the motor running beyond the duration requested by the host.
+- This test is mandatory because the button task can change `motor_state` independently of host commands.
 
-## Điều kiện chấp nhận trước khi chạy production
+## Production Acceptance Criteria
 
-Chỉ coi hệ thống đạt khi tất cả điều kiện sau đều pass:
+Do not consider the system production-ready until all of the following conditions pass:
 
-- `PING/PONG`, exact `ACK` và `DONE` đúng protocol.
-- `RIGHT/LEFT` đúng với hướng vật trên ảnh calibrated.
-- Motor dừng vật lý sau `DONE`, STOP và Stop/Exit.
-- Không có MOVE được gửi sau khi Stop/Exit bắt đầu.
-- Camera disconnect không dẫn đến action dựa trên frame cũ.
-- Calibration đúng ở vị trí camera triển khai thực tế.
-- Closed-loop đưa đúng vật thể vào giữa và mở lại composer.
-- No-match 20 lần và technical retry 5 lần hoạt động đúng.
-- Manual button không phá vỡ giới hạn an toàn của host control.
+- `PING/PONG`, exact `ACK`, and `DONE` follow the documented protocol.
+- `RIGHT/LEFT` matches movement in the calibrated image.
+- The motor physically stops after `DONE`, STOP, and Stop/Exit.
+- No MOVE command is sent after Stop/Exit begins.
+- A disconnected camera cannot produce actions from stale frames.
+- Calibration is correct at the deployed camera position.
+- Closed-loop control centers the correct object and enables the composer again.
+- The 20 no-match attempts and five technical retries behave as documented.
+- Manual buttons do not violate the host controller's safety limits.
 
-## Giới hạn và rủi ro cần theo dõi
+## Known Limitations and Risks
 
-- Firmware phát `DONE` ngay sau khi cập nhật shared motor state; motor task có thể cần thêm một khoảng ngắn để thực hiện I2C STOP vật lý.
-- Manual button task có thể thay đổi `motor_state` trong lúc host pulse vẫn đang được firmware theo dõi.
-- `IMAGE_RIGHT_IS_FORWARD` phụ thuộc cách đấu dây motor và phải được xác minh trên hệ thống thật.
-- Camera phải giữ nguyên vị trí sau calibration.
+- The firmware emits `DONE` immediately after changing the shared motor state; the motor task may need a short additional interval to perform the physical I2C STOP.
+- The manual button task can change `motor_state` while the firmware is still tracking a host pulse.
+- `IMAGE_RIGHT_IS_FORWARD` depends on motor wiring and must be verified on the real system.
+- The camera must remain fixed after calibration.
 
-## Bảo mật
+## Security
 
-Không commit `.env` hoặc API key. `.env` đã được loại khỏi Git; chỉ chia sẻ `.env.example`.
+Never commit `.env` or an API key. `.env` is excluded from Git; share only `.env.example`.
 
 ## Firmware
 
-Thư mục `conveyor_firmware` là PlatformIO project cho YoloUNO/ESP32. Controller hiện giữ nguyên protocol của firmware và không gửi bracketed action token trực tiếp xuống board.
+The `conveyor_firmware` directory is the PlatformIO project for the YoloUNO/ESP32. The controller preserves the firmware's existing serial protocol and never sends bracketed action tokens directly to the board.
