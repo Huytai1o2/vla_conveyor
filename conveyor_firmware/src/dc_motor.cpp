@@ -7,7 +7,7 @@ constexpr uint8_t MOTOR_M4 = 3;
 
 constexpr uint8_t DIR_FORWARD = 0;
 constexpr uint8_t DIR_BACKWARD = 1;
-constexpr int MOTOR_SPEED = 90;
+constexpr int MOTOR_SPEED = 100;
 
 void setMotorSpeed(uint8_t motor, int speed) {
     speed = constrain(speed, -MOTOR_SPEED, MOTOR_SPEED);
