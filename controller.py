@@ -478,9 +478,9 @@ def plan_action(result):
         )
 
     direction = (
-        "RIGHT"
+        "LEFT"
         if error_cm < 0
-        else "LEFT"
+        else "RIGHT"
     )
 
     move_distance_cm = max(
