@@ -1,275 +1,496 @@
-# VLA Conveyor Control
+# Calibrated VLA Conveyor Control
 
-A Vision-Language-Action (VLA) system that uses Gemini to identify an operator-specified object, generate conveyor actions, and center the object on a reversible conveyor belt.
+A continuously running Vision-Language-Action controller for a reversible
+YoloUNO conveyor. An operator calibrates the camera and enters unrestricted
+natural-language instructions in one desktop GUI. Gemini identifies the requested
+object, plans one or more ordered belt waypoints, and generates each movement
+direction and duration.
 
-> Current status: the software has passed syntax checks and mock tests for the state machine, action validation, and serial protocol. The hardware bench-test checklist must still be completed with the real camera, YoloUNO board, and motor before the system is considered production-ready or safe for unattended operation.
+> The software has passed syntax and pure/mock checks, but the complete system is
+> not production-ready until the hardware bench-test checklist passes with the
+> deployed camera, YoloUNO, motor, load, power supply, and safety procedure.
 
-## Architecture and Runtime Flow
+## Runtime Flow
 
 ```text
-Connect the YoloUNO and camera
-              |
-              v
-Calibration: select the four conveyor corners
-              |
-              v
+YoloUNO PING/PONG + camera frame check
+                    |
+                    v
+One Tkinter dashboard opens
+  left: raw camera / calibration / warped live image
+  right: state, logs, calibration controls, chat
+                    |
+                    v
+Capture one frame and click physical TL, BL, TR, BR
+                    |
+                    v
 OpenCV creates a 1000 x 300 perspective transform
-              |
-              v
-Open the dashboard
-  - calibrated real-time image on the left
-  - chat, status, and logs on the right
-              |
-              v
-The operator submits an object instruction
-              |
-              v
-Calibrated image + instruction + conveyor parameters
-              |
-              v
-Gemini generates a VLA action
-  direction + duration_ms + task_status
-              |
-              v
-The controller validates and displays the action tokens
-              |
-              v
-The action is adapted to the firmware serial protocol
-              |
-              v
-YoloUNO ACK -> motor movement -> DONE
-              |
-              v
-Wait for settling, capture a fresh frame, and repeat
+                    |
+                    v
+Enter one natural-language object + destination sequence
+                    |
+                    v
+Gemini returns waypoints + perception + executable action
+                    |
+                    v
+Python validates the current waypoint and action
+                    |
+                    v
+Visible action tokens -> firmware MOVE/STOP command
+                    |
+                    v
+Exact ACK -> timed motor pulse -> DONE -> 1.5 s settle
+                    |
+                    v
+Fresh image -> next correction or next locked waypoint
+                    |
+                    v
+Final waypoint reached -> next operator instruction
 ```
 
-### Responsibility Boundaries
+There is no fixed inference-step limit. The application continues accepting new
+instructions until Stop/Exit is selected or a fatal error stops the controller.
 
-OpenCV is used only to:
+## Responsibility Boundary
 
-- Capture camera frames.
-- Let the operator select the four conveyor corners.
-- Calculate and apply the perspective transform.
-- Produce the calibrated `1000 x 300` image and draw the center target zone.
-- Display and encode images.
+OpenCV is used for:
+
+- camera capture;
+- four-point calibration and perspective warping;
+- conversion to a normalized `1000 x 300` belt image;
+- JPEG encoding;
+- display-only calibration markers, state text, target lines, and model point.
+
+OpenCV does **not** detect, classify, segment, center, or track the object. It
+does not generate motor duration.
 
 Gemini is responsible for:
 
-- Finding the object that matches the instruction submitted in the sidebar.
-- Returning the normalized object center as `[y, x]`.
-- Selecting `LEFT`, `RIGHT`, or `STOP`.
-- Generating `duration_ms` and `task_status` directly.
+- matching the loose movable object described by the operator;
+- parsing natural language into `1..12` ordered waypoint x values;
+- returning the object's normalized `[y, x]` point;
+- generating `LEFT`, `RIGHT`, or `STOP`;
+- calculating `duration_ms` from the supplied belt calibration;
+- returning `MOVE`, `AT_TARGET`, `TARGET_NOT_FOUND`, or
+  `INVALID_INSTRUCTION`.
 
-The Python controller does not recalculate an action from the returned coordinates. It only verifies that Gemini's result is safe and valid before communicating with the firmware.
+Python strictly validates Gemini's structured result. It checks the reported
+point against the current waypoint, verifies that direction approaches the
+destination, enforces duration limits, and blocks movement inside tolerance.
+Python never creates a fallback MOVE or recalculates Gemini's duration.
 
-## VLA Actions and Firmware Protocol
+The Gemini model configured in `controller.py` is
+`gemini-robotics-er-1.6-preview`.
 
-A valid Gemini result is shown in the dashboard as an action-token sequence:
+## Natural-Language Waypoints
+
+The sidebar accepts natural language, not a command template. One message must
+identify one object and one or more ordered destinations, for example:
+
+```text
+move the red tape roll to the right, then return it to the middle
+move the white charger to 25% of the belt, then to the far right
+đưa cuộn băng keo đỏ sang trái rồi về giữa băng chuyền
+```
+
+Gemini initially returns the complete ordered `waypoints_x` array in normalized
+coordinates `0..1000`. Qualitative defaults are:
+
+| Position | Normalized x |
+|---|---:|
+| far left / left edge | `0` |
+| left | `200` |
+| center / middle | `500` |
+| right | `800` |
+| far right / right edge | `1000` |
+
+Exact percentages, fractions, centimeters, initial positions, or visible
+landmarks override these defaults. The controller locks the first valid array.
+Every subsequent model result must preserve that array and the active index.
+
+For every waypoint:
+
+- Outside the `4 cm` tolerance: validate and execute Gemini's alignment MOVE.
+- At an intermediate waypoint: send STOP and advance to the next locked index.
+- At the final waypoint: apply the final guard, send STOP, finish the instruction,
+  and enable the composer.
+
+## Action Tokens and Firmware Protocol
+
+The GUI and terminal show the validated executable action as:
 
 ```text
 [ACT_RIGHT] [DURATION_0780_MS] [STATUS_MOVE]
 ```
 
-The bracketed action tokens are used only for display and auditing. The current firmware does not parse the bracketed representation. The controller adapts it to the protocol implemented in `conveyor_firmware/src/main.cpp`:
+These bracketed tokens are for VLA observability and auditing. The firmware does
+not parse them. `controller.py` adapts them to the protocol implemented by
+`conveyor_firmware/src/main.cpp`:
 
-| Controller sends | Firmware responds | Meaning |
+| Host sends | Firmware response | Meaning |
 |---|---|---|
-| `PING\n` | `PONG` | Verify the board connection |
-| `STOP\n` | `STOPPED` | Stop the motor |
-| `MOVE,RIGHT,780\n` | `ACK,RIGHT,780`, then `DONE` | Move right for 780 ms |
-| `MOVE,LEFT,300\n` | `ACK,LEFT,300`, then `DONE` | Move left for 300 ms |
+| `PING\n` | `PONG` | Verify the YoloUNO connection |
+| `STOP\n` | `STOPPED` | Request motor stop |
+| `MOVE,RIGHT,780\n` | `ACK,RIGHT,780`, then `DONE` | Timed image-right pulse |
+| `MOVE,LEFT,300\n` | `ACK,LEFT,300`, then `DONE` | Timed image-left pulse |
 
-The host controller allows durations from `80` to `1500 ms`, even though the firmware accepts values from `50` to `3000 ms`.
+The host accepts Gemini MOVE durations from `80` through `1500 ms`. Firmware
+constrains received durations to `50..3000 ms`. The host requires the exact ACK
+before accepting DONE; mismatched/duplicate ACK, DONE before ACK, `ERR,*`, and
+timeouts are fatal.
 
-`IMAGE_RIGHT_IS_FORWARD` in `conveyor_firmware/src/main.cpp` maps image-relative movement to the physical motor direction:
+`IMAGE_RIGHT_IS_FORWARD` in `conveyor_firmware/src/main.cpp` maps image-relative
+direction to motor wiring:
 
-- When set to `false`, `MOVE,RIGHT` uses `MOTOR_BACKWARD`, while `MOVE,LEFT` uses `MOTOR_FORWARD`.
-- If `MOVE,RIGHT` makes the object move left in the calibrated image, change this value to `true` and flash the firmware again.
+- Current value: `false`.
+- `MOVE,RIGHT` therefore selects `MOTOR_BACKWARD`.
+- `MOVE,LEFT` selects `MOTOR_FORWARD`.
+- If RIGHT moves the object left in the calibrated image, change the constant to
+  `true`, rebuild, and flash the firmware.
 
-## Instruction Lifecycle
+## Requirements
 
-1. After calibration, the dashboard enters `WAITING_FOR_PROMPT`.
-2. The operator enters an instruction in the right sidebar and selects **Send**.
-3. The composer is disabled while that instruction is active.
-4. Gemini analyzes the latest frame and generates an action.
-5. The controller validates the action and displays its action tokens before sending a serial command.
-6. For `MOVE`, the controller requires the exact `ACK,<direction>,<duration>` before accepting `DONE`.
-7. After every pulse, the controller waits for the object to settle and analyzes a fresh frame.
-8. For `CENTERED`, the motor receives `STOP`, the sidebar displays `SUCCESS`, and the composer is enabled for the next instruction.
+- Python 3.10 or newer is recommended.
+- A desktop environment with Tkinter.
+- Gemini API key.
+- YoloUNO/ESP32 running the firmware in `conveyor_firmware`.
+- UVC camera and reversible conveyor.
 
-If the object is removed or no longer matches the instruction:
+On Ubuntu/Debian, install Tkinter if it is missing:
 
-- A motor pulse that has already started is allowed to finish.
-- The next inference sends or maintains `STOP`.
-- The sidebar displays `WARNING: target not recognized - retry n/20`.
-- If the matching object returns, the counter resets and control resumes.
-- After 20 consecutive no-match results, the instruction is abandoned and the composer is enabled again.
+```bash
+sudo apt install python3-tk
+```
 
-Gemini connection failures, timeouts, rate limits, invalid JSON/schema, and invalid actions use a separate `n/5` technical retry counter:
-
-- The motor remains at `STOP`.
-- Network failures are displayed as `RECONNECTING`.
-- Invalid model data or schema is displayed as `ERROR`.
-- Any valid Gemini result resets the technical counter.
-- The fifth consecutive technical failure triggers a safe shutdown.
-
-## Installation and Startup
-
-Create a virtual environment and install the dependencies:
+Create the environment and install Python dependencies:
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Create `.env` from the example file and add a Gemini API key:
+Windows activation:
+
+```powershell
+.venv\Scripts\activate
+```
+
+## Configuration
+
+Copy the example and add your own API key:
 
 ```bash
 cp .env.example .env
 ```
 
+Current example configuration:
+
 ```dotenv
 GEMINI_API_KEY=your_gemini_api_key
+
+CAMERA_DEVICE=auto
+CAMERA_MATCH=UGREEN
+
+SERIAL_PORT=/dev/ttyACM0
+SERIAL_MATCH=Espressif
+SERIAL_BAUD=115200
 ```
 
-Verify the following constants in `controller.py` before starting:
+### Camera selection
+
+- `CAMERA_DEVICE=auto` prefers a matching stable Linux
+  `/dev/v4l/by-id/*-video-index0`, then `/dev/video*`.
+- `CAMERA_MATCH=UGREEN` selects the external camera instead of the laptop webcam.
+- Use an explicit path when needed, for example
+  `CAMERA_DEVICE=/dev/v4l/by-id/usb-...-video-index0` or `/dev/video4`.
+- On Windows, use a numeric index such as `CAMERA_DEVICE=0`.
+
+### MCU selection
+
+- The deployed YoloUNO currently appears as `/dev/ttyACM0`.
+- `SERIAL_PORT=auto` prefers a matching `/dev/serial/by-id` entry and otherwise
+  probes `ttyACM*`/`ttyUSB*` using `PING/PONG`.
+- On Windows, use a value such as `SERIAL_PORT=COM18`.
+- Close PlatformIO Serial Monitor before starting the controller because only one
+  process can own the port.
+
+The physical calibration constants are currently hard-coded in `controller.py`:
 
 ```python
-CAMERA_INDEX = 0
-SERIAL_PORT = "COM18"
-SERIAL_BAUD = 115200
 BELT_LENGTH_CM = 77.0
 SPEED_TEST_DISTANCE_CM = 77.0
 SPEED_TEST_TIME_S = 5.5925
+TARGET_TOLERANCE_CM = 4.0
 ```
 
-Close the PlatformIO Serial Monitor so it does not hold the COM port, then run:
+Re-measure these values when belt length, motor speed, voltage, load, gearing, or
+mechanics change.
+
+## Running the Controller
 
 ```bash
 python controller.py
 ```
 
-### Calibration
+Startup order:
 
-1. Press `S` to capture the calibration frame or `Q` to exit.
-2. Click the four corners of the conveyor region in any order.
-3. Right-click to undo, or press `R` to start the selection again.
-4. Press `Enter`, `Return`, or `Space` when the polygon is valid.
-5. Do not move the camera after calibration. Recalibrate whenever the camera position changes.
+1. Verify Tkinter/Pillow.
+2. Connect to the YoloUNO and receive `PONG`.
+3. Open the camera and receive a valid frame.
+4. Open the single calibration/runtime dashboard.
 
-After calibration, the dashboard opens with the calibrated real-time image on the left and the control sidebar on the right.
+The Gemini client is created lazily when the first instruction is analyzed.
+
+## Calibration in the Dashboard
+
+1. Confirm the complete conveyor is visible in the raw live view.
+2. Select **Capture** or press `S`.
+3. Click the physical belt corners in this exact semantic order:
+   `1=top-left`, `2=bottom-left`, `3=top-right`, `4=bottom-right`.
+4. Follow the belt's physical orientation even if the camera view looks rotated
+   or inverted.
+5. Right-click/**Undo** removes the last point.
+6. `R`/**Reset** clears all points.
+7. **Live** discards the frozen frame; **Retake** captures another one.
+8. Select **Confirm** or press `Enter` after the polygon becomes valid.
+
+The same left canvas then changes to the calibrated `1000 x 300` live image. No
+OpenCV calibration window or second GUI opens. The composer becomes available
+only after confirmation.
+
+GUI shortcuts:
+
+| Key | Action |
+|---|---|
+| `S` | Capture/retake during calibration |
+| `R` | Reset calibration points while selecting |
+| `Enter` | Confirm valid calibration |
+| `Ctrl+Enter` | Submit a runtime instruction |
+| `F11` | Toggle full-screen |
+| `Esc` | Exit full-screen |
+
+Resize and full-screen operations fit the image without cumulative zoom and map
+calibration clicks back to the original camera frame.
+
+## Runtime States and Logs
+
+The right sidebar displays controller states including:
+
+```text
+CALIBRATION_LIVE, CALIBRATION_SELECTING, WAITING_FOR_PROMPT,
+ANALYZING, MOVING, SETTLING, WAYPOINT_REACHED, TARGET_MISSING,
+MODEL_RETRY, INVALID_INSTRUCTION, AT_TARGET, ERROR, STOPPING
+```
+
+Messages appear in both the GUI and terminal. Gemini exceptions additionally
+print their Python traceback in the terminal.
+
+The composer is disabled during calibration and while one instruction is active.
+Blank messages are rejected; instructions are not queued behind an active task.
+
+## Missing Object and Retry Behavior
+
+If the requested object is absent, no longer matches the prompt, or confidence is
+below `0.60`:
+
+- the current pulse may finish;
+- the next inference requests/maintains STOP;
+- the sidebar logs `target not recognized - retry n/20`;
+- the controller waits one second and uses a fresh frame;
+- returning the matching object resets the no-match counter;
+- attempt 20 abandons only that instruction and re-enables the composer.
+
+Gemini connection, timeout, rate-limit, JSON/schema, and validation errors use a
+separate technical counter:
+
+- the motor is stopped before retry;
+- API/runtime failures appear as `RECONNECTING`;
+- invalid model data appears as `ERROR`;
+- retry delay is two seconds;
+- a valid result resets the counter;
+- the fifth consecutive error is fatal.
+
+HTTP `4xx` errors other than `408` and `429` are treated as non-retryable and
+become fatal immediately.
+
+A fatal runtime error sets the stop event, disables the composer, and leaves the
+dashboard available to display the error. Select **Stop / Exit** or close the
+window to finish resource cleanup.
+
+## Camera and Serial Troubleshooting
+
+### `VIDIOC_REQBUFS: errno=19 (No such device)`
+
+The camera was opened but disappeared from Linux while OpenCV requested buffers.
+This is normally a USB disconnect/reset, power, cable, hub, or UVC transport
+problem—not a calibration-GUI error. Camera auto-reconnect is not implemented.
+
+Check:
+
+```bash
+lsusb
+ls -l /dev/v4l/by-id/
+v4l2-ctl --list-devices
+journalctl -k -n 100 --no-pager
+```
+
+Reconnect the camera directly to the laptop, try another port/cable, wait for the
+stable by-id path to return, and restart `controller.py`.
+
+### Camera cannot be opened
+
+- Verify `CAMERA_DEVICE` and `CAMERA_MATCH`.
+- Close browsers, video-call applications, and other camera viewers.
+- Check ownership with `fuser /dev/videoX`.
+- Confirm the user has permission to read the video device.
+
+### YoloUNO cannot connect
+
+- Check `ls -l /dev/ttyACM* /dev/serial/by-id/`.
+- Close PlatformIO Serial Monitor.
+- Verify `115200` baud and that the firmware prints `READY`/responds `PONG`.
+- Confirm serial-device permissions (commonly membership in `dialout` on Linux).
+- Use `SERIAL_PORT=auto` if the ACM device number changes.
+
+### Gemini fails
+
+- Confirm `GEMINI_API_KEY` is present in `.env` without quotes or trailing text.
+- Read the complete `[GEMINI ERROR]` traceback in the terminal.
+- A deterministic HTTP 4xx usually requires fixing the request, API access, model
+  availability, billing, or credentials rather than retrying.
+
+## Firmware and Serial Test
+
+Build/flash the PlatformIO project in `conveyor_firmware`. The firmware uses:
+
+- `115200` baud;
+- motor output M4 over I2C;
+- motor speed magnitude `100`;
+- host pulse range constrained to `50..3000 ms`;
+- physical forward/reverse buttons with a `20 s` hold timeout.
+
+`serial_test.py` currently defaults to `PORT = "COM18"` and sends one real
+`MOVE,RIGHT,300` pulse. Edit `PORT` before running it on Linux. Run it only when
+physical movement is safe:
+
+```bash
+python serial_test.py
+```
+
+Expected order:
+
+```text
+PONG
+ACK,RIGHT,300
+DONE
+```
 
 ## Hardware Bench-Test Checklist
 
-A bench test verifies the complete integration with the physical camera, controller board, and motor. Run the checks in the following order and do not skip the initial safety steps.
+### 0. Safety
 
-### 0. Safety Preparation
+- Clear the conveyor and use a lightweight non-jamming test object.
+- Keep hands, hair, and clothing away from the drivetrain.
+- Provide a way to disconnect motor power immediately.
+- Do not treat the software Stop button as a certified emergency stop.
 
-- Clear the hazardous area around the conveyor.
-- Use a lightweight test object that is unlikely to jam the mechanism.
-- Ensure that motor power can be disconnected immediately.
-- Keep hands away from the drivetrain whenever a MOVE command may be sent.
-- Close the PlatformIO Serial Monitor before opening the controller.
+### 1. Firmware handshake and protocol
 
-### 1. Firmware Handshake
+- Verify `READY`, `PING/PONG`, exact ACK, DONE, and `STOP/STOPPED`.
+- Inject wrong ACK, stale DONE, missing DONE, and `ERR,*` using a mock before
+  relying on the real motor.
+- Confirm the motor physically stops after DONE and STOPPED.
 
-- Flash the firmware from `conveyor_firmware` to the YoloUNO.
-- Verify the `115200` baud rate and the selected COM port.
-- Run `serial_test.py` only when conveyor movement is safe.
-- Pass when the board returns `PONG`, `ACK,RIGHT,300`, and `DONE` in that order.
-- Fail if ACK/DONE is missing, ACK contains the wrong direction or duration, or any `ERR,*` line appears.
+### 2. Direction
 
-> `serial_test.py` sends one `MOVE,RIGHT,300` pulse. Run it only when the motor can move safely.
+- After calibration, send a short image-relative RIGHT pulse.
+- Pass only if the object moves right in the calibrated image.
+- Repeat for LEFT.
+- If reversed, change `IMAGE_RIGHT_IS_FORWARD`, rebuild, and flash.
 
-### 2. Motor Direction
+### 3. Calibration and scale
 
-- Place an object where its movement is easy to observe.
-- Send `MOVE,RIGHT,300`.
-- Pass if the object moves right in the calibrated image.
-- If it moves left, change `IMAGE_RIGHT_IS_FORWARD` in the firmware and flash the board again.
-- Repeat with `MOVE,LEFT,300` and confirm that the object moves left.
+- Test multiple reasonable camera angles/heights, including a visually inverted
+  view.
+- Verify physical `TL, BL, TR, BR` fills the complete `1000 x 300` output.
+- Resize/full-screen before clicking and verify the selected physical points stay
+  correct.
+- Verify requested waypoint/tolerance lines move to the active destination.
+- Re-measure full-belt travel time under the deployed load.
 
-### 3. Physical STOP and DONE
+### 4. Single and multi-waypoint control
 
-- Send a short MOVE command and observe the motor.
-- Pass if the motor physically stops when the firmware emits `DONE`.
-- Select **Stop / Exit** while the motor is moving.
-- Pass if the controller sends STOP, the motor stops, and no delayed MOVE appears after the Stop action.
-- Disconnect motor power immediately if the motor continues moving after `DONE` or `STOPPED`.
+- Test an arbitrary single destination rather than only center.
+- Test natural language such as right → middle and left → right → middle.
+- Verify `Locked waypoint sequence` appears once and remains unchanged.
+- Verify each intermediate waypoint advances exactly once.
+- Verify only the last waypoint completes the instruction.
+- Confirm displayed validated tokens match each firmware MOVE.
 
-### 4. Camera and Calibration
+### 5. Object removal
 
-- Calibrate from at least three reasonable camera angles or mounting heights.
-- Confirm that the complete conveyor length maps into the `1000 x 300` warped image.
-- Confirm that the two green lines consistently mark the physical center zone.
-- Move the camera after calibration and verify that calibration is performed again before operation continues.
+- Remove the requested object after a pulse begins.
+- Verify the current pulse finishes, the next inference stops, and warnings count
+  upward.
+- Return the correct object and verify control resumes with the same waypoint.
+- Leave it absent for 20 valid no-match responses and verify a new prompt becomes
+  available without restarting the application.
 
-### 5. Real-Time Dashboard
+### 6. Retry and invalid instruction
 
-- Confirm that the calibrated image on the left continues updating while idle, during Gemini analysis, while the motor is moving, and during retries.
-- Confirm that the right sidebar includes an auto-scrolling transcript, current state, composer, Send, and Stop/Exit controls.
-- Confirm that `INFO`, `SUCCESS`, `WARNING`, `RECONNECTING`, and `ERROR` messages are visually distinguishable.
-- Confirm that the GUI remains responsive during Gemini API calls and firmware waits.
+- Submit an ambiguous instruction and verify no MOVE is sent.
+- Simulate timeout, rate-limit, invalid JSON, schema mismatch, and invalid action.
+- Verify the motor remains stopped and counters reset after a valid result.
+- Verify failure number five enters ERROR without sending another MOVE.
 
-### 6. Closed-Loop Centering
+### 7. Disconnect and shutdown
 
-- Place an object away from the center and submit an instruction that describes it accurately.
-- Confirm that the action tokens appear before the firmware command.
-- Confirm that the direction and duration in the action tokens exactly match the `MOVE` command.
-- Pass when the object reaches the center, the firmware receives STOP, the sidebar displays SUCCESS, and the composer is enabled again.
+- Disconnect the camera while calibrating, idle, analyzing, and moving.
+- Disconnect the MCU during STOP and MOVE waits.
+- Select Stop/Exit during Gemini analysis, settling, and a motor pulse.
+- Verify no late model response produces a MOVE after shutdown begins.
 
-### 7. Object Removal
+### 8. Manual firmware buttons
 
-- While centering is active, remove the object after a motor pulse has started.
-- Pass if the current pulse completes, the next inference keeps the motor stopped, and the warning increases through `1/20`, `2/20`, and so on.
-- Return the matching object and confirm that control resumes automatically and the no-match counter resets.
-- Leave the object absent for 20 attempts and confirm that the instruction is abandoned while the application remains active.
+- Test both physical buttons while host control is idle and active.
+- Verify release stops the motor and the `20 s` timeout prevents indefinite hold.
+- Confirm button writes to shared `motor_state` cannot violate the host safety
+  expectations for the deployed operating procedure.
 
-### 8. Gemini Retries
+## Known Limitations
 
-- Temporarily interrupt network access or use a mock to produce a timeout or rate-limit error.
-- Confirm that the sidebar displays `RECONNECTING n/5` and that the motor remains stopped.
-- Use an invalid-schema mock response and confirm that the sidebar displays `ERROR` without sending MOVE.
-- Pass if the fifth consecutive technical failure shuts the application down safely.
-
-### 9. Camera Disconnection
-
-- Disconnect the camera while the dashboard is idle and while an instruction is active.
-- Pass if stale-frame detection enters ERROR, stops the motor, and shuts down safely.
-- Fail if the controller continues using an old frame to issue MOVE actions.
-
-### 10. Manual Buttons
-
-- Test the physical forward and reverse buttons while the host is idle and while a host pulse is active.
-- Confirm that manual input cannot leave the motor running beyond the duration requested by the host.
-- This test is mandatory because the button task can change `motor_state` independently of host commands.
+- Camera auto-reconnect is not implemented; a USB reset requires restart and
+  recalibration.
+- Calibration is not saved between runs.
+- Physical belt constants and Gemini model name are code constants, not `.env`
+  settings.
+- Control depends on Gemini API latency, availability, and model quality.
+- The firmware's manual buttons and host commands share the same global
+  `motor_state`.
+- Firmware emits DONE when it updates the shared stop state; the motor task applies
+  the I2C stop on its next polling cycle.
+- The GUI remains open after a fatal worker error so the operator can read the log;
+  close it to release all resources.
+- A physical emergency stop and guarded mechanical design are still required for
+  safe deployment.
 
 ## Production Acceptance Criteria
 
-Do not consider the system production-ready until all of the following conditions pass:
+Do not approve unattended operation until all of these pass on the real system:
 
-- `PING/PONG`, exact `ACK`, and `DONE` follow the documented protocol.
-- `RIGHT/LEFT` matches movement in the calibrated image.
-- The motor physically stops after `DONE`, STOP, and Stop/Exit.
-- No MOVE command is sent after Stop/Exit begins.
-- A disconnected camera cannot produce actions from stale frames.
-- Calibration is correct at the deployed camera position.
-- Closed-loop control centers the correct object and enables the composer again.
-- The 20 no-match attempts and five technical retries behave as documented.
-- Manual buttons do not violate the host controller's safety limits.
-
-## Known Limitations and Risks
-
-- The firmware emits `DONE` immediately after changing the shared motor state; the motor task may need a short additional interval to perform the physical I2C STOP.
-- The manual button task can change `motor_state` while the firmware is still tracking a host pulse.
-- `IMAGE_RIGHT_IS_FORWARD` depends on motor wiring and must be verified on the real system.
-- The camera must remain fixed after calibration.
+- correct camera calibration and physical scale at the installed position;
+- correct image-relative LEFT/RIGHT mapping;
+- exact firmware handshake, ACK/DONE ordering, and reliable STOP;
+- correct arbitrary and multi-waypoint completion;
+- no movement for missing/wrong objects, invalid instructions, or invalid model
+  output;
+- safe behavior for object removal, camera loss, MCU loss, Gemini failure, and
+  Stop/Exit races;
+- manual buttons cannot defeat the operating safety procedure;
+- independent physical emergency-stop capability is available.
 
 ## Security
 
-Never commit `.env` or an API key. `.env` is excluded from Git; share only `.env.example`.
-
-## Firmware
-
-The `conveyor_firmware` directory is the PlatformIO project for the YoloUNO/ESP32. The controller preserves the firmware's existing serial protocol and never sends bracketed action tokens directly to the board.
+Never commit `.env` or an API key. `.env` and debug images are ignored by Git;
+share only `.env.example`.

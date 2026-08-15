@@ -1,151 +1,296 @@
-# Calibrated VLA Conveyor Control
+# Calibrated VLA Conveyor Controller — Implementation and Validation Plan
 
-## Summary
+## 1. Objective
 
-Refactor `controller.py` into a continuously running, GUI-driven VLA pipeline:
+`controller.py` is a continuously running desktop controller for a reversible
+YoloUNO conveyor. The operator calibrates an arbitrarily mounted camera, submits
+a natural-language task, and Gemini converts the task and the current calibrated
+image into an ordered waypoint plan plus executable movement actions.
 
-`CALIBRATE → OPEN DASHBOARD → CHAT PROMPT → CAPTURE/WARP → GEMINI ACTION → EXECUTE → REPEAT`
+The implemented flow is:
 
-OpenCV remains responsible only for camera I/O, camera-position calibration, perspective normalization, visualization, and image encoding. Gemini is responsible for identifying the prompted object and generating the complete VLA action: `direction`, `duration_ms`, and `status`. Python validates that action and adapts it to the existing firmware serial protocol; it does not detect the object or calculate movement duration itself.
+```text
+Connect MCU and camera
+        → open one dashboard
+        → capture calibration frame
+        → click TL, BL, TR, BR and confirm
+        → submit a natural-language instruction
+        → Gemini parses and returns ordered waypoints
+        → validate/execute the active waypoint
+        → capture a fresh frame after each pulse
+        → advance through all locked waypoints
+        → enable the composer for the next instruction
+```
 
-After calibration, the application opens a Codex-style runtime dashboard. The left side continuously displays the calibrated conveyor image, while a chat/status sidebar on the right replaces terminal input. The application processes prompts indefinitely and exits only when the dashboard is closed, the operator selects the stop/exit control, a fatal camera/serial/motor error occurs, or Gemini fails five consecutive times.
+The process has no fixed step limit. It remains available for new instructions
+until Stop/Exit is selected or a fatal controller condition sets the shared stop
+event.
 
-## Calibration and VLA Boundary
+## 2. VLA and OpenCV Boundary
 
-- Keep the existing four-corner calibration so the camera may be mounted at an arbitrary fixed position.
-- Use `cv2.getPerspectiveTransform()` once after corner selection and apply the resulting homography with `cv2.warpPerspective()` to every inference frame.
-- Keep the calibrated output at `1000 x 300`. Its full width represents the configured physical belt length of `77 cm`, giving a scale of `77 / 1000 = 0.077 cm` per normalized x unit.
-- Draw the two green target-zone lines on the warped image. With a `4 cm` tolerance, the target zone is approximately `x=448..552`, centered at `x=500`.
-- Recalibrate whenever the camera position changes; reuse the matrix while the camera remains fixed.
-- Close the calibration windows after the four corners are accepted, then open the runtime dashboard. The dashboard's left panel must show the latest perspective-normalized frame, not the raw camera frame.
-- OpenCV may capture, warp, annotate, display, save, and JPEG-encode frames. It must not detect/classify the object, find its center using classical vision, track it, decide movement direction, or calculate `duration_ms`.
+OpenCV is permitted for camera and geometric calibration only:
 
-## Gemini Action Contract
+- camera acquisition;
+- four-point perspective calibration;
+- perspective warping to `1000 x 300`;
+- JPEG encoding for Gemini;
+- display-only calibration markers, target lines, status text, and Gemini point;
+- optional debug-frame output when `WRITE_DEBUG_IMAGES=True`.
 
-- After hardware connection and calibration, enable the dashboard chat box and ask the operator for a full task instruction. Reject blank submissions in the GUI without starting a job.
-- Treat each submitted chat message as one complete target instruction. Append it to the sidebar immediately as a user message, disable the composer while that instruction is active, and re-enable it only when the controller is ready for a new instruction.
-- Send Gemini the warped image, the operator instruction, the fixed conveyor policy, and these calibration/control values:
-  - belt length: `77 cm`;
-  - normalized image x range: `0..1000`, with center at `500`;
-  - center tolerance: `4 cm`;
-  - measured belt speed: `77 / 5.5925`, approximately `13.77 cm/s`;
-  - move gain: `0.8`;
-  - valid move duration: `80..1500 ms`;
-  - near-center threshold: `8 cm`, with a maximum pulse of `180 ms`.
-- Instruct Gemini to identify only a loose object whose appearance matches the active user instruction. Other loose objects are not valid substitutes.
-- Gemini must return a structured `VLAResult` containing:
-  - `target_found: bool`;
-  - `target_matches_prompt: bool`;
-  - `label: str | None`;
-  - `point: list[int] | None` as normalized `[y, x]` for logging/auditing;
-  - `direction: LEFT | RIGHT | STOP`;
-  - `duration_ms: int`;
-  - `task_status: MOVE | CENTERED | TARGET_NOT_FOUND`;
-  - `confidence: float` in `0..1`.
-- Gemini calculates movement duration using the calibrated scale and current controller policy:
+OpenCV must not detect, classify, segment, or track the target object. It must
+not calculate the object's center or generate a MOVE duration.
 
-  ```text
-  offset_cm = abs(object_x - 500) * 77 / 1000
-  move_distance_cm = max(0, offset_cm - 4)
-  duration_ms = clamp(move_distance_cm / 13.77 * 0.8 * 1000, 80, 1500)
-  if offset_cm <= 8: duration_ms = min(duration_ms, 180)
-  ```
+Gemini is responsible for:
 
-- Direction semantics remain image-relative: an object left of the target requires `RIGHT`; an object right of the target requires `LEFT`.
-- Enforce output invariants before touching the motor:
-  - `MOVE` requires a matching target, confidence at least `0.60`, direction `LEFT` or `RIGHT`, and duration `80..1500 ms`;
-  - `CENTERED` requires a matching target, `STOP`, and duration `0`;
-  - missing, nonmatching, or low-confidence targets resolve to `TARGET_NOT_FOUND`, `STOP`, and duration `0`;
-  - contradictory, malformed, or out-of-range output is invalid model data and follows the technical retry policy.
-- Remove the existing `plan_action()` geometry and duration calculation. Python may validate or reject Gemini's values but must not replace them with a separately calculated action.
+- matching the loose movable object described by the operator;
+- parsing unrestricted natural language into `1..12` ordered waypoint x values;
+- reporting the object's normalized `[y, x]` point;
+- generating `LEFT`, `RIGHT`, or `STOP`;
+- calculating `duration_ms` from the supplied physical calibration policy;
+- reporting `MOVE`, `AT_TARGET`, `TARGET_NOT_FOUND`, or
+  `INVALID_INSTRUCTION`.
 
-## Action Tokens and Firmware Integration
+Python performs strict safety validation. It uses Gemini's reported point to
+check waypoint tolerance and movement direction, but it never creates a fallback
+MOVE or recomputes Gemini's duration. It may normalize an unsafe or stale result
+to `STOP/0/AT_TARGET` when the reported point is already inside tolerance.
 
-- Serialize the validated Gemini action with the existing function:
+## 3. Hardware Discovery and Startup
 
-  ```text
-  [ACT_RIGHT] [DURATION_0780_MS] [STATUS_MOVE]
-  ```
+1. Load `.env` next to `controller.py`.
+2. Verify Tkinter and Pillow before opening hardware.
+3. Open the YoloUNO serial port and require a `PING`/`PONG` handshake.
+4. Open the configured camera and require at least one valid frame.
+5. Start one continuous `CameraStream` capture thread.
+6. Open the single Tkinter dashboard in `CALIBRATION_LIVE`.
+7. Start the Gemini/serial control worker only after calibration is confirmed.
 
-- Treat this string as the visible/auditable VLA action token output. `action_tokens()` must receive the direction, duration, and status produced by Gemini rather than values calculated by Python.
-- Preserve the current firmware protocol without modifying `conveyor_firmware`:
-  - a validated move token is adapted to `MOVE,<direction>,<duration_ms>\n`;
-  - `CENTERED`, `TARGET_NOT_FOUND`, cancellation, and failures send `STOP\n`;
-  - wait for firmware `ACK` and `DONE` exactly as the current `run_motor()` does.
-- Keep the controller's `1500 ms` maximum even though the firmware accepts up to `3000 ms`; this is the host-side VLA safety limit.
+Device settings:
 
-## Continuous Control Behavior
+- `CAMERA_DEVICE`: explicit index/path or `auto`;
+- `CAMERA_MATCH`: preferred Linux V4L2/by-id description;
+- `SERIAL_PORT`: explicit device/COM port or `auto`;
+- `SERIAL_MATCH`: preferred serial by-id/port description;
+- `SERIAL_BAUD`: defaults to `115200`;
+- `GEMINI_API_KEY`: required when the first instruction is analyzed.
 
-- Replace the fixed `MAX_STEPS` loop with an outer prompt loop and an unlimited inner control loop for each active instruction.
-- For every valid `MOVE` result:
-  1. log the Gemini perception and exact action tokens;
-  2. send the adapted serial command;
-  3. allow the complete timed motor pulse to finish;
-  4. wait `SETTLE_S` while the camera stream continues updating;
-  5. capture and analyze the newest warped frame.
-- When Gemini returns `CENTERED`, send `STOP`, stop making model calls for that instruction, append a green success message to the sidebar, and re-enable the chat composer for the next prompt.
-- When the prompted object is absent, no longer matches, or is below the confidence threshold:
-  - send/keep `STOP`;
-  - log `WARNING: target not recognized - retry n/20`;
-  - wait one second and analyze a fresh frame;
-  - reset the no-match counter after any valid matching-target result.
-- After 20 consecutive valid no-match results, abandon the active instruction, append a final warning explaining that the target could not be recovered, and re-enable the chat composer without exiting the application.
-- If the object is grabbed during a motor pulse, finish that pulse. The first post-settle inference detects the missing target, stops further movement, and starts the warning/retry sequence.
-- Maintain separate technical retries for Gemini connection, timeout, rate-limit, invalid JSON, schema, and invariant failures. Keep the motor stopped, log `reconnect` or `invalid data`, wait two seconds, and retry the same instruction. Valid model output resets this counter; the fifth consecutive technical failure triggers safe application shutdown.
-- Camera read failures, serial failures, missing firmware acknowledgements, and motor timeouts remain fatal and trigger safe shutdown.
-- Closing the dashboard or selecting its stop/exit control must set the shared stop event, stop the motor, unblock the worker, and release serial, camera, worker, Tkinter, and OpenCV resources.
+On Linux, camera auto-discovery prefers matching `*-video-index0` paths under
+`/dev/v4l/by-id`, followed by `/dev/video*`. Serial auto-discovery prefers a
+matching `/dev/serial/by-id` entry and otherwise probes `ttyACM*`/`ttyUSB*` using
+the firmware handshake.
 
-## Dashboard, Chat, and Threading
+## 4. Single-Window Calibration
 
-- Build the post-calibration dashboard with standard `tkinter`/`ttk`; add Pillow to `requirements.txt` for converting OpenCV BGR frames into Tkinter-compatible RGB images.
-- Use a two-column layout:
-  - a resizable left panel for the calibrated `1000 x 300` real-time conveyor image;
-  - a fixed-width right sidebar for conversation, status history, and prompt entry.
-- The right sidebar contains:
-  - a scrollable, auto-scrolling transcript;
-  - visually distinct user prompts and controller messages;
-  - a multiline prompt composer and Send button;
-  - a compact current-state indicator;
-  - a Stop/Exit control that always remains available.
-- Present controller events with stable Codex-style severity treatments:
-  - `INFO` in neutral/blue for analyzing, action tokens, motor movement, and settling;
-  - `SUCCESS` in green when the target reaches the center;
-  - `WARNING` in amber for `target not recognized - retry n/20` and prompt abandonment;
-  - `RECONNECTING` in blue/amber for Gemini retry `n/5`;
-  - `ERROR` in red for invalid model output and fatal camera, serial, motor, or exhausted-retry failures.
-- Show each Gemini-generated action token in the transcript, for example `[ACT_RIGHT] [DURATION_0780_MS] [STATUS_MOVE]`, before sending its adapted firmware command.
-- Display the live state and last Gemini point as overlays on the calibrated image only for observability; they must not participate in control calculations.
-- Retain `CameraStream` as the continuous capture thread so the left-side preview remains active during movement, Gemini calls, settling, warnings, and idle chat time.
-- Keep Tkinter and all widget/image updates on the main thread. Refresh the latest calibrated frame with `root.after(...)`; never update Tkinter widgets from a worker thread.
-- Retain one control worker for Gemini inference, action validation, and serial execution. Replace blocking `input()` with a thread-safe prompt queue populated by the Send button.
-- Add a thread-safe UI event queue. The control worker publishes structured events containing severity, message, and optional state/action data; the Tkinter main thread drains the queue with `root.after(...)` and updates the transcript and state indicator.
-- Use the shared stop event for dashboard closure and fatal errors. Queue reads and waits must use timeouts so the worker can observe shutdown without hanging.
-- Support these display states: `WAITING_FOR_PROMPT`, `ANALYZING`, `MOVING`, `SETTLING`, `TARGET_MISSING`, `MODEL_RETRY`, `CENTERED`, `ERROR`, and `STOPPING`.
+The dashboard must not open a separate OpenCV HighGUI window.
 
-## Test Plan
+1. Show the raw real-time camera in the left canvas.
+2. Capture/freeze one frame with **Capture** or `S`.
+3. Require semantic click order:
+   `1=physical top-left`, `2=physical bottom-left`,
+   `3=physical top-right`, `4=physical bottom-right`.
+4. Interpret physical orientation rather than apparent screen orientation so a
+   rotated or inverted camera remains valid.
+5. Map resized/full-screen canvas clicks back to original-frame coordinates.
+6. Allow right-click/**Undo**, `R`/**Reset**, **Live**, and retake.
+7. Accept only a convex four-corner polygon with sufficient source-frame area.
+8. Build one homography with `cv2.getPerspectiveTransform()` and map the physical
+   belt to `1000 x 300` using `cv2.warpPerspective()`.
+9. Switch the same canvas to the annotated warped live stream and enable chat.
 
-- Calibrate from several camera angles and verify the selected belt corners consistently map to the full `1000 x 300` inference image and the green target zone remains centered.
-- Mock Gemini with valid `LEFT` and `RIGHT` actions and verify the exact model-generated durations appear in `action_tokens()` and in the corresponding firmware `MOVE` commands without Python recomputation.
-- Verify `CENTERED` produces `[ACT_STOP] [DURATION_0000_MS] [STATUS_CENTERED]`, sends `STOP`, and immediately returns to the prompt loop.
-- Reject MOVE responses with `STOP`, duration outside `80..1500`, missing target data, contradictory status, malformed point, or low confidence; never send a MOVE command for these cases.
-- Remove the prompted object during a pulse and verify the pulse finishes, the next inference warns, the motor remains stopped, and the same instruction resumes when the matching object returns.
-- Return 20 consecutive valid no-match results and verify warnings `1/20` through `20/20`, followed by a new prompt. Verify a valid match resets this counter.
-- Simulate five consecutive Gemini technical failures and verify they do not consume no-match attempts, every retry keeps the motor stopped, and the fifth failure performs safe shutdown. Verify valid output resets the technical counter.
-- Verify the Send button rejects blank text, appends a valid user message, disables the composer during an active instruction, and re-enables it after `CENTERED` or 20 no-match results.
-- Verify `INFO`, `SUCCESS`, `WARNING`, `RECONNECTING`, and `ERROR` events appear with the correct visual treatment and chronological order in the auto-scrolling sidebar.
-- Verify dashboard closure and the Stop/Exit control safely stop the motor and terminate the worker even while it is awaiting a prompt, waiting between retries, or waiting for firmware completion.
-- Verify serial `ACK`, `DONE`, `ERR`, and timeout handling with mocked board responses.
-- Verify the calibrated left-side image continues updating while the motor runs, Gemini analyzes, retries are active, and the GUI waits for the next chat instruction.
-- Verify all Tkinter changes occur on the main thread and worker-to-GUI communication uses only the UI event queue.
+The camera must remain fixed after confirmation. Calibration is not persisted;
+moving the camera or restarting the program requires calibration again.
 
-## Assumptions
+## 5. Physical Calibration Policy
 
-- The camera remains physically fixed after calibration; moving it requires a new calibration.
-- OpenCV calibration and perspective normalization are permitted because they establish the camera-to-belt scale and do not perform object perception or action selection.
-- Gemini, not `plan_action()`, is the authoritative source of direction, duration, and status.
-- The bracketed action-token string is the VLA output representation for logging and review. The unchanged firmware still receives its supported `MOVE,...` or `STOP` serial command.
-- The runtime interaction is GUI-only; the terminal may still receive diagnostic output but is not used to submit target instructions.
-- Only one target instruction is active at a time. The chat composer is disabled while it is active rather than queueing additional jobs.
-- Calibration remains an OpenCV interaction shown before the Tkinter dashboard; after calibration, the dashboard is the primary runtime interface.
-- Twenty no-match retries means 20 consecutive valid model responses in which the instructed target is absent, nonmatching, or below the confidence threshold.
-- Five Gemini technical retries means safe shutdown on the fifth consecutive technical failure.
+The current controller constants are:
+
+```text
+belt length                  77 cm
+speed calibration distance  77 cm
+speed calibration time      5.5925 s
+measured speed               approximately 13.77 cm/s
+normalized belt x            0..1000
+target tolerance             4 cm
+move gain                    0.8
+host MOVE duration           80..1500 ms
+near-target threshold        8 cm
+near-target maximum pulse    180 ms
+qualitative left/center/right 200/500/800
+```
+
+These values describe the deployed physical belt and must be recalibrated in
+code if the conveyor speed, length, load, voltage, gearing, or motor changes.
+
+## 6. Natural-Language Waypoint Planning
+
+Each sidebar message describes one object and one or more ordered destinations.
+The language is unrestricted; it is not a command template. Gemini resolves
+qualitative positions, percentages, fractions, centimeters from the physical
+left edge, visible landmarks, and temporal phrases such as “then” or “return”.
+
+Examples:
+
+```text
+move the red tape roll to the right, then return it to the middle
+    → approximately [800, 500]
+
+move the white charger to 25% of the belt, then to the far right
+    → [250, 1000]
+```
+
+The first valid model response supplies the complete waypoint array. The host
+copies and locks it. Every later inference must return the exact locked array and
+the exact active index. Reordering, restarting, adding, deleting, or silently
+reinterpreting waypoints is invalid model data.
+
+## 7. Gemini Structured Contract
+
+The API wire schema and strict local `VLAResult` contain:
+
+```text
+target_found: bool
+target_matches_prompt: bool
+label: string | null
+point: [y, x] | null              # integer values in 0..1000
+instruction_valid: bool
+waypoints_x: list[int]            # 1..12 values in 0..1000 when valid
+active_waypoint_index: int | null
+direction: LEFT | RIGHT | STOP
+duration_ms: int
+task_status: MOVE | AT_TARGET | TARGET_NOT_FOUND | INVALID_INSTRUCTION
+confidence: float                 # 0..1
+```
+
+The controller uses a minimal Gemini API schema because the Robotics endpoint
+rejects Pydantic's `additionalProperties` conversion. Full strictness, including
+unknown-field rejection, is applied locally with Pydantic.
+
+Gemini receives an unannotated calibrated image, never the dashboard overlay.
+The configured model is `gemini-robotics-er-1.6-preview`, temperature is `0.2`,
+thinking budget is `0`, and the client timeout is `15 s`.
+
+## 8. Validation and Waypoint State Machine
+
+Validation occurs before any motor command:
+
+- Invalid/ambiguous instruction: empty waypoint plan,
+  `INVALID_INSTRUCTION/STOP/0`, no target data; end that instruction.
+- Missing, nonmatching, or confidence below `0.60`:
+  `TARGET_NOT_FOUND/STOP/0`.
+- Matching target: require a valid normalized point.
+- Inside `4 cm` of the active waypoint: normalize to `AT_TARGET/STOP/0` before
+  interpreting stale action fields.
+- Outside tolerance: require `LEFT` or `RIGHT`, `80..1500 ms`, and a direction
+  that approaches the destination. No Python-generated correction MOVE exists.
+
+For each locked waypoint:
+
+```text
+validate current waypoint
+    reached and intermediate → STOP → increment index → continue
+    reached and final        → final guard/STOP → complete instruction
+    not reached              → execute validated MOVE → settle → reanalyze
+```
+
+The final guard applies only to task completion at the last waypoint. Intermediate
+waypoints are position validations that advance the locked sequence; they do not
+finish the instruction.
+
+## 9. Action Tokens and Firmware Adapter
+
+The dashboard and terminal log the validated executable action as:
+
+```text
+[ACT_RIGHT] [DURATION_0780_MS] [STATUS_MOVE]
+```
+
+This token format is for VLA observability only. The YoloUNO firmware does not
+parse brackets. The host adapts actions to:
+
+```text
+PING\n
+STOP\n
+MOVE,<LEFT|RIGHT>,<duration_ms>\n
+```
+
+For MOVE, the host requires the exact `ACK,<direction>,<duration_ms>` before a
+later `DONE`. A mismatched/duplicate ACK, DONE before ACK, firmware `ERR,*`, serial
+exception, or timeout is fatal. The Stop/Exit event and final MOVE write share a
+lock so a late model response cannot race a shutdown request into a new MOVE.
+
+Firmware accepts `50..3000 ms`; the host deliberately restricts Gemini to
+`80..1500 ms`. `IMAGE_RIGHT_IS_FORWARD` maps image-relative directions to motor
+forward/backward and must be verified on the physical conveyor.
+
+## 10. Continuous Operation, Missing Objects, and Retries
+
+After every MOVE, wait for firmware DONE, wait `1.5 s` for settling, then analyze
+the newest frame. A motor pulse already in progress is allowed to finish unless
+Stop/Exit is requested.
+
+If the instructed object is grabbed or disappears:
+
+- issue/maintain STOP;
+- log `target not recognized - retry n/20`;
+- wait `1 s` and analyze a fresh frame;
+- reset the counter after a valid matching response;
+- after attempt 20, abandon only the current instruction and accept a new one.
+
+Gemini/API/schema failures have a separate counter:
+
+- print the exception and traceback to the terminal;
+- show `RECONNECTING` for API/runtime failures or `ERROR` for invalid model data;
+- require firmware `STOPPED` before retrying;
+- wait `2 s` between attempts;
+- reset the counter after any valid model result;
+- fail on the fifth consecutive technical error.
+
+Deterministic HTTP `4xx` errors are immediately fatal except `408` and `429`,
+which use the technical retry policy.
+
+Camera stale/disconnect (`>3 s`), serial failures, STOP acknowledgement failure,
+and motor protocol timeouts are fatal. Camera auto-reconnect is not implemented.
+A fatal runtime condition sets ERROR, disables new prompts, and requests stop;
+the dashboard remains available to show the error until the operator closes it.
+
+## 11. GUI and Concurrency
+
+- Tkinter and all widget updates remain on the main thread.
+- `CameraStream` owns continuous camera reads.
+- One control worker owns Gemini inference, validation, and serial actions.
+- A prompt queue transfers sidebar input to the worker.
+- A UI event queue transfers state/log events back to Tkinter.
+- The left canvas fits and centers frames without cumulative zoom animation.
+- Fonts, button padding, sidebar width, and click mapping respond to resize and
+  full-screen (`F11`); `Esc` exits full-screen.
+- The composer is disabled during calibration and while an instruction is active.
+- Gemini errors are printed both in the GUI and terminal.
+
+## 12. Validation Plan
+
+### Software checks
+
+- Compile `controller.py` and run `git diff --check`.
+- Test canvas-to-source coordinate mapping with letterboxing and full-screen sizes.
+- Test normal, rotated, and visually inverted calibration corner arrangements.
+- Mock strict schema validation, waypoint locking, intermediate advancement, and
+  final completion.
+- Mock no-match recovery, invalid instruction, retry exhaustion, late Stop/Exit,
+  exact ACK/DONE ordering, wrong ACK, stale DONE, ERR, and timeouts.
+- Confirm no `cv2.imshow`, `waitKey`, or separate HighGUI calibration window exists.
+
+### Required hardware bench tests
+
+- Verify `PING/PONG`, exact ACK, DONE, STOP/STOPPED, and physical motor stop.
+- Verify `MOVE,RIGHT` moves right in the calibrated image and `MOVE,LEFT` moves
+  left; change and reflash `IMAGE_RIGHT_IS_FORWARD` if required.
+- Validate physical scale and duration at several belt locations and camera angles.
+- Run a single arbitrary destination and a multi-waypoint return sequence.
+- Remove and restore the target during closed-loop operation.
+- Disconnect the camera and MCU separately and verify no further MOVE is sent.
+- Test Stop/Exit during Gemini analysis, settling, and an active pulse.
+- Test manual firmware buttons because they share `motor_state` with host control.
+
+The system is not production-ready or safe for unattended operation until all
+hardware bench tests pass with the deployed camera, board, motor, power supply,
+load, and emergency-stop procedure.
