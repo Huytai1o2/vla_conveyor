@@ -5,3 +5,7 @@ google-genai>=1.15.0
 pydantic
 python-dotenv
 Pillow
+fastapi
+uvicorn[standard]
+aiortc
+pyzmq

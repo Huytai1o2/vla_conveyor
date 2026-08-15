@@ -2,7 +2,7 @@
 
 A continuously running Vision-Language-Action controller for a reversible
 YoloUNO conveyor. An operator calibrates the camera and enters unrestricted
-natural-language instructions in one desktop GUI. Gemini identifies the requested
+natural-language instructions in one web dashboard. Gemini identifies the requested
 object, plans one or more ordered belt waypoints, and generates each movement
 direction and duration.
 
@@ -16,7 +16,7 @@ direction and duration.
 YoloUNO PING/PONG + camera frame check
                     |
                     v
-One Tkinter dashboard opens
+Open the WebRTC dashboard in a browser
   left: raw camera / calibration / warped live image
   right: state, logs, calibration controls, chat
                     |
@@ -151,12 +151,13 @@ direction to motor wiring:
 ## Requirements
 
 - Python 3.10 or newer is recommended.
-- A desktop environment with Tkinter.
+- A modern browser for the default WebRTC dashboard.
 - Gemini API key.
 - YoloUNO/ESP32 running the firmware in `conveyor_firmware`.
 - UVC camera and reversible conveyor.
 
-On Ubuntu/Debian, install Tkinter if it is missing:
+Tkinter is needed only for the legacy `python controller.py` entry point. On
+Ubuntu/Debian, install it if that fallback is required:
 
 ```bash
 sudo apt install python3-tk
@@ -227,7 +228,41 @@ TARGET_TOLERANCE_CM = 4.0
 Re-measure these values when belt length, motor speed, voltage, load, gearing, or
 mechanics change.
 
-## Running the Controller
+## Running the Web Controller
+
+Build the frontend once:
+
+```bash
+cd web
+npm install
+npm run build
+cd ..
+```
+
+Start the complete hardware service, ZMQ bridge, WebSocket/WebRTC gateway, and
+static frontend:
+
+```bash
+python web_server.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:8000
+```
+
+The controller service is the only process that opens the YoloUNO and camera.
+The FastAPI gateway receives its frames/events over localhost-only ZMQ and sends
+video to the browser through WebRTC.
+
+For frontend development, run `npm run dev` inside `web/` and keep
+`VITE_GATEWAY_URL=http://localhost:8000`.
+
+### Legacy Tkinter entry point
+
+The original single-process interface remains available and uses exactly the
+same controller logic:
 
 ```bash
 python controller.py
@@ -238,7 +273,7 @@ Startup order:
 1. Verify Tkinter/Pillow.
 2. Connect to the YoloUNO and receive `PONG`.
 3. Open the camera and receive a valid frame.
-4. Open the single calibration/runtime dashboard.
+4. Start the WebRTC stream and browser calibration/runtime dashboard.
 
 The Gemini client is created lazily when the first instruction is analyzed.
 
@@ -255,11 +290,12 @@ The Gemini client is created lazily when the first instruction is analyzed.
 7. **Live** discards the frozen frame; **Retake** captures another one.
 8. Select **Confirm** or press `Enter` after the polygon becomes valid.
 
-The same left canvas then changes to the calibrated `1000 x 300` live image. No
+The same video panel then changes to the calibrated `1000 x 300` live image. No
 OpenCV calibration window or second GUI opens. The composer becomes available
 only after confirmation.
 
-GUI shortcuts:
+The browser provides full-screen and video-fit controls. The following keyboard
+shortcuts apply to the legacy Tkinter UI:
 
 | Key | Action |
 |---|---|
@@ -359,6 +395,12 @@ stable by-id path to return, and restart `controller.py`.
 - Read the complete `[GEMINI ERROR]` traceback in the terminal.
 - A deterministic HTTP 4xx usually requires fixing the request, API access, model
   availability, billing, or credentials rather than retrying.
+
+### WebRTC `OPTIONS /api/webrtc/offer` returns 400
+
+Rebuild the frontend and restart `web_server.py`. Production uses the page's
+same origin; loopback CORS accepts both `localhost` and `127.0.0.1`. Avoid serving
+an old bundle that hard-codes the other hostname.
 
 ## Firmware and Serial Test
 
@@ -460,6 +502,9 @@ DONE
 
 ## Known Limitations
 
+- The default web runtime is local-only and has no authentication. Keep
+  `WEB_HOST=127.0.0.1`; authentication and TLS are required before LAN/Internet
+  exposure.
 - Camera auto-reconnect is not implemented; a USB reset requires restart and
   recalibration.
 - Calibration is not saved between runs.

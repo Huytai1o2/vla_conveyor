@@ -294,3 +294,22 @@ the dashboard remains available to show the error until the operator closes it.
 The system is not production-ready or safe for unattended operation until all
 hardware bench tests pass with the deployed camera, board, motor, power supply,
 load, and emergency-stop procedure.
+
+## 13. Web Dashboard Runtime
+
+The default web runtime is implemented without modifying the control algorithm:
+
+- `web/`: minimal shadcn-style React/Vite UI with a `2/3` WebRTC video area,
+  `1/3` VLA conversation panel, calibration controls, telemetry, and Stop;
+- `web_backend/controller_service.py`: the only web-mode owner of camera and MCU;
+  imports the existing calibration helpers and starts the unchanged
+  `controller.control_loop()` after confirmation;
+- `web_backend/gateway.py`: FastAPI static/API server, operator WebSocket, aiortc
+  offer/answer endpoint, and fixed-size live video track;
+- ZMQ `ROUTER/DEALER`: acknowledged commands and snapshots;
+- ZMQ `PUB/SUB`: controller events/telemetry and bounded latest preview frames;
+- `web_server.py`: one-command child-service and gateway launcher.
+
+The browser never receives raw firmware MOVE authority. Natural-language prompts
+and Stop requests cross the gateway; Gemini validation, waypoint progression,
+serial ACK/DONE enforcement, and motor safety remain in `controller.py`.
